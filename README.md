@@ -5,7 +5,18 @@
 
 ---
 
-## 🚀 快速开始
+## 🌐 在线体验
+
+📍 **部署地址即将更新**
+
+前端部署：[![Vercel](https://img.shields.io/badge/Vercel-部署中-blue)](https://vercel.com)  
+后端部署：[![Railway](https://img.shields.io/badge/Railway-部署中-purple)](https://railway.app)
+
+详细部署步骤见 **[DEPLOYMENT.md](./DEPLOYMENT.md)**
+
+---
+
+## 🚀 本地开发
 
 ```bash
 cd /Users/pinya_hu/Desktop/tare/AI_quiz_new

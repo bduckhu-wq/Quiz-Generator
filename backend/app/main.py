@@ -16,7 +16,11 @@ app = FastAPI(
 # CORS 配置（允许前端跨域）
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 生产环境应限制具体域名
+    allow_origins=[
+        "http://localhost:3000",  # 本地开发
+        "https://quiz-generator-3qks.vercel.app",  # Vercel 生产环境
+        "https://*.vercel.app",  # Vercel 预览环境
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

@@ -1,0 +1,580 @@
+"""
+ExamWorkflow 节点函数
+
+每个节点是一个独立的处理函数：
+- 接收 State
+- 执行逻辑（可能调用 LLM、工具、其他 Workflow）
+- 更新 State
+- 返回更新后的 State
+"""
+
+import time
+import json
+import re
+from typing import Dict, List
+from .state import ExamWorkflowState
+from services.llm_service import LLMService
+from services.question_service import QuestionService
+from models.base import SessionLocal
+from models import Subject, Grade, QuestionType, Difficulty
+from utils.question_validator import QuestionValidator
+
+
+# ========== 辅助函数 ==========
+
+def add_trace(state: ExamWorkflowState, step: str, duration: float, result: Dict = None):
+    """
+    添加执行追踪记录（避免 LangGraph state 累积问题）
+
+    Args:
+        state: 当前状态
+        step: 步骤名称
+        duration: 执行时长
+        result: 执行结果（可选）
+    """
+    new_trace = state.get("execution_trace", []).copy()
+    trace_entry = {
+        "step": step,
+        "timestamp": time.time(),
+        "duration": duration
+    }
+    if result is not None:
+        trace_entry["result"] = result
+
+    new_trace.append(trace_entry)
+    state["execution_trace"] = new_trace
+
+
+# ========== 节点 1: 提取参数 ==========
+
+async def extract_parameters(state: ExamWorkflowState) -> ExamWorkflowState:
+    """
+    从对话历史中提取结构化参数
+
+    流程：
+    1. 构建 Prompt（包含 Skill 策略）
+    2. 调用 LLM 提取参数
+    3. 更新 state["extracted_params"]
+    """
+    start_time = time.time()
+
+    # 初始化 LLM 服务
+    llm = LLMService(provider="deepseek")
+
+    # 构建提取 Prompt
+    system_prompt = f"""你是一个参数提取助手。
+
+{state["skill_context"]}
+
+**任务**：从用户对话中提取出题参数。
+
+**输出格式**（必须严格 JSON）：
+{{
+    "subject": "学科名称（数学/物理/化学等）",
+    "grade": "年级（初一/初二/初三/高一/高二/高三）",
+    "knowledge_points": ["知识点1", "知识点2"],
+    "scene": "场景（homework/unit_test/exam/review，如果未明确指定则为 null）"
+}}
+
+**规则**：
+- 如果某个参数缺失，设为 null
+- knowledge_points 如果未明确，根据上下文推断（如"一元二次方程"、"函数"）
+- 只返回 JSON，不要有其他文字"""
+
+    # 调用 LLM
+    messages = state["messages"] + [{"role": "user", "content": state["user_input"]}]
+    response = await llm.chat(
+        messages=messages,
+        system_prompt=system_prompt,
+        stream=False
+    )
+
+    # 解析 JSON
+    try:
+        content = response.content.strip()
+        json_match = re.search(r'\{.*\}', content, re.DOTALL)
+        if json_match:
+            extracted = json.loads(json_match.group(0))
+        else:
+            extracted = {}
+    except Exception as e:
+        print(f"⚠️  参数提取失败: {e}")
+        extracted = {}
+
+    # 更新状态
+    state["extracted_params"] = extracted
+    state["current_step"] = "extract_parameters"
+    add_trace(state, "extract_parameters", time.time() - start_time, extracted)
+
+    return state
+
+
+# ========== 节点 2: 检查参数完整性 ==========
+
+async def check_completeness(state: ExamWorkflowState) -> ExamWorkflowState:
+    """
+    检查参数是否完整
+
+    必需参数：subject, grade, knowledge_points
+    """
+    start_time = time.time()
+
+    params = state["extracted_params"]
+    required_fields = ["subject", "grade", "knowledge_points"]
+
+    # 检查缺失
+    missing = []
+    for field in required_fields:
+        if not params.get(field):
+            missing.append(field)
+
+    # 更新状态
+    state["is_params_complete"] = len(missing) == 0
+    state["missing_params"] = missing
+    state["current_step"] = "check_completeness"
+    add_trace(state, "check_completeness", time.time() - start_time,
+              {"is_complete": state["is_params_complete"], "missing": missing})
+
+    return state
+
+
+# ========== 节点 3: 生成追问 ==========
+
+async def generate_followup(state: ExamWorkflowState) -> ExamWorkflowState:
+    """
+    生成追问消息（参数不完整时）
+
+    根据 Skill 策略生成友好的追问
+    """
+    start_time = time.time()
+
+    missing = state["missing_params"]
+    llm = LLMService(provider="deepseek")
+
+    # 构建追问 Prompt
+    system_prompt = f"""你是一个友好的出题助手。
+
+{state["skill_context"]}
+
+**任务**：用户缺失以下参数：{', '.join(missing)}
+
+生成一个友好、简洁的追问，引导用户补充。
+- 不要太生硬
+- 可以给出常见选项示例
+- 一次只问一个参数
+- 不超过 50 字"""
+
+    response = await llm.chat(
+        messages=[{"role": "user", "content": "请生成追问"}],
+        system_prompt=system_prompt,
+        stream=False
+    )
+
+    followup_message = response.content.strip()
+
+    # 更新状态
+    state["needs_followup"] = True
+    state["followup_message"] = followup_message
+    state["current_step"] = "generate_followup"
+    add_trace(state, "generate_followup", time.time() - start_time)
+
+    return state
+
+
+# ========== 节点 4: 匹配场景策略 ==========
+
+async def match_scene_strategy(state: ExamWorkflowState) -> ExamWorkflowState:
+    """
+    匹配场景策略（基于 Skill 配置）
+
+    流程：
+    1. 读取 Skill 中的场景策略表
+    2. 根据关键词或明确指定匹配场景
+    3. 返回场景配置（难度分布、题型分布、题量）
+    """
+    start_time = time.time()
+
+    # TODO: 从 Skill 配置加载场景策略
+    # from skills.loader import SkillLoader
+    # skill_config = SkillLoader().load_skill_config("exam_skill")
+    # scene_strategies = skill_config["scene_strategies"]
+
+    # 模拟场景策略（开发时用）
+    scene_strategies = {
+        "homework": {
+            "difficulty_distribution": {"easy": 0.5, "medium": 0.4, "hard": 0.1},
+            "question_type_distribution": {"choice": 0.3, "blank": 0.4, "solution": 0.3},
+            "total_count": 12,
+            "total_score": 100
+        },
+        "unit_test": {
+            "difficulty_distribution": {"easy": 0.3, "medium": 0.5, "hard": 0.2},
+            "question_type_distribution": {"choice": 0.4, "blank": 0.3, "solution": 0.3},
+            "total_count": 15,
+            "total_score": 100
+        }
+    }
+
+    # 确定场景
+    scene = state["extracted_params"].get("scene") or "unit_test"  # 默认单元测验
+    scene_config = scene_strategies.get(scene, scene_strategies["unit_test"])
+    scene_config["scene"] = scene
+
+    # 更新状态
+    state["scene_config"] = scene_config
+    state["current_step"] = "match_scene_strategy"
+    add_trace(state, "match_scene_strategy", time.time() - start_time, {"scene": scene})
+
+    return state
+
+
+# ========== 节点 5: 计算题目分配 ==========
+
+async def calculate_allocation(state: ExamWorkflowState) -> ExamWorkflowState:
+    """
+    计算题目分配方案
+
+    根据场景配置计算每种（题型 + 难度）的题目数量
+    """
+    start_time = time.time()
+
+    scene_config = state["scene_config"]
+    total_count = scene_config["total_count"]
+    type_dist = scene_config["question_type_distribution"]
+    diff_dist = scene_config["difficulty_distribution"]
+
+    allocation = {}
+
+    for qtype, type_ratio in type_dist.items():
+        type_count = round(total_count * type_ratio)
+        allocation[qtype] = {}
+
+        for difficulty, diff_ratio in diff_dist.items():
+            count = round(type_count * diff_ratio)
+            allocation[qtype][difficulty] = max(1, count)  # 至少 1 题
+
+    # 更新状态
+    state["allocation"] = allocation
+    state["current_step"] = "calculate_allocation"
+    add_trace(state, "calculate_allocation", time.time() - start_time, allocation)
+
+    return state
+
+
+# ========== 节点 6: 搜题 ==========
+
+async def search_questions(state: ExamWorkflowState) -> ExamWorkflowState:
+    """
+    调用搜题服务（数据库检索）
+
+    根据知识点、学科、年级、题型、难度搜索题目
+    """
+    start_time = time.time()
+
+    # 初始化数据库服务
+    db = SessionLocal()
+    service = QuestionService(db)
+
+    try:
+        # 提取参数
+        params = state["extracted_params"]
+        allocation = state["allocation"]
+
+        # 转换枚举类型
+        subject = Subject(params["subject"])
+        grade = Grade(params["grade"])
+        knowledge_points = params.get("knowledge_points", [])
+
+        # 按分配方案搜索题目
+        search_results = []
+
+        for qtype, diff_breakdown in allocation.items():
+            # 映射题型
+            qtype_enum = _map_question_type(qtype)
+
+            for difficulty, count in diff_breakdown.items():
+                if count == 0:
+                    continue
+
+                # 转换难度（映射英文到中文枚举值）
+                diff_map = {
+                    "easy": Difficulty.EASY,  # "简单"
+                    "medium": Difficulty.MEDIUM,  # "中等"
+                    "hard": Difficulty.HARD  # "困难"
+                }
+                diff_enum = diff_map.get(difficulty)
+
+                # 搜索题目
+                questions = service.search(
+                    subject=subject,
+                    grade=grade,
+                    question_types=[qtype_enum] if qtype_enum else None,
+                    difficulties=[diff_enum],
+                    knowledge_points=knowledge_points if knowledge_points else None,
+                    limit=count
+                )
+
+                # 转为字典
+                for q in questions:
+                    search_results.append(q.to_dict())
+
+        # 更新状态
+        state["search_results"] = search_results
+        state["current_step"] = "search_questions"
+        add_trace(state, "search_questions", time.time() - start_time,
+                  {"found_count": len(search_results)})
+
+    finally:
+        db.close()
+
+    return state
+
+
+def _map_question_type(qtype: str) -> QuestionType:
+    """映射题型名称到枚举"""
+    mapping = {
+        "choice": QuestionType.SINGLE_CHOICE,
+        "blank": QuestionType.BLANK,
+        "solution": QuestionType.SOLUTION,
+        "calculation": QuestionType.CALCULATION,
+        "proof": QuestionType.PROOF
+    }
+    return mapping.get(qtype)
+
+
+# ========== 节点 7: 分析缺口 ==========
+
+async def analyze_gap(state: ExamWorkflowState) -> ExamWorkflowState:
+    """
+    分析题目缺口
+
+    计算需要 AI 生成的题目数量
+    """
+    start_time = time.time()
+
+    allocation = state["allocation"]
+    search_results = state["search_results"]
+
+    # 统计已搜到的题目
+    found_count = {}
+    for q in search_results:
+        qtype = q["question_type"]
+        difficulty = q["difficulty"]
+
+        # 映射回分配方案的键
+        qtype_key = _reverse_map_question_type(qtype)
+        diff_key = difficulty.lower() if difficulty != "中等" else "medium"
+
+        if qtype_key not in found_count:
+            found_count[qtype_key] = {}
+        found_count[qtype_key][diff_key] = found_count[qtype_key].get(diff_key, 0) + 1
+
+    # 计算缺口
+    gap_breakdown = {}
+    total_gap = 0
+
+    for qtype, diff_breakdown in allocation.items():
+        gap_breakdown[qtype] = {}
+        for difficulty, needed in diff_breakdown.items():
+            found = found_count.get(qtype, {}).get(difficulty, 0)
+            gap = max(0, needed - found)
+            gap_breakdown[qtype][difficulty] = gap
+            total_gap += gap
+
+    # 更新状态
+    state["gap"] = total_gap
+    state["gap_breakdown"] = gap_breakdown
+    state["current_step"] = "analyze_gap"
+    add_trace(state, "analyze_gap", time.time() - start_time,
+              {"gap": total_gap, "breakdown": gap_breakdown})
+
+    return state
+
+
+def _reverse_map_question_type(qtype_name: str) -> str:
+    """反向映射题型"""
+    mapping = {
+        "单选题": "choice",
+        "填空题": "blank",
+        "解答题": "solution",
+        "计算题": "calculation",
+        "证明题": "proof"
+    }
+    return mapping.get(qtype_name, "solution")
+
+
+# ========== 节点 8: AI 生成题目 ==========
+
+async def generate_questions(state: ExamWorkflowState) -> ExamWorkflowState:
+    """
+    调用 AI 生成题目（优化版：批量生成 + 质量校验）
+
+    基于缺口，调用 LLM 批量生成补充题目
+    """
+    start_time = time.time()
+
+    llm = LLMService(provider="deepseek")
+    params = state["extracted_params"]
+    gap_breakdown = state["gap_breakdown"]
+    search_results = state["search_results"]
+
+    # 提取参考题目风格
+    reference_style = QuestionValidator.extract_reference_style(search_results) if search_results else {}
+
+    # 构建所有缺口需求
+    generation_requirements = []
+    total_count = 0
+    for qtype, diff_breakdown in gap_breakdown.items():
+        for difficulty, count in diff_breakdown.items():
+            if count > 0:
+                generation_requirements.append({
+                    "type": qtype,
+                    "difficulty": difficulty,
+                    "count": count
+                })
+                total_count += count
+
+    if total_count == 0:
+        # 无需生成
+        state["generated_questions"] = []
+        state["current_step"] = "generate_questions"
+        add_trace(state, "generate_questions", time.time() - start_time, {"generated_count": 0})
+        return state
+
+    # 批量生成（一次 LLM 调用）
+    generated_questions = []
+
+    try:
+        # 构建需求描述
+        requirements_text = "
+".join([
+            f"- {req['count']}道 {_map_qtype_display(req['type'])} ({_map_difficulty_display(req['difficulty'])})"
+            for req in generation_requirements
+        ])
+
+        style_hint = ""
+        if reference_style:
+            style_hint = f"""
+**参考风格**（请模仿题库风格）：
+- 题目长度约 {reference_style.get('avg_content_length', 100)} 字
+- 答案长度约 {reference_style.get('avg_answer_length', 50)} 字
+"""
+
+        system_prompt = f"""你是一个专业的 K12 出题专家。
+
+**任务**：批量生成以下题目（共 {total_count} 道）：
+{requirements_text}
+
+**要求**：
+- 学科：{params['subject']}
+- 年级：{params['grade']}
+- 知识点：{', '.join(params.get('knowledge_points', []))}
+{style_hint}
+
+**输出格式**（JSON 数组）：
+[
+  {{
+    "question_type": "单选题",
+    "difficulty": "简单",
+    "content": "题目内容",
+    "options": ["A. ...", "B. ...", "C. ...", "D. ..."],
+    "answer": "答案",
+    "analysis": "解析",
+    "score": 5
+  }}
+]
+
+**注意**：
+- 只返回 JSON，不要有其他文字
+- 严格按照题型和难度要求生成
+- 题目要贴合知识点
+- 答案要准确"""
+
+        response = await llm.chat(
+            messages=[{"role": "user", "content": f"生成 {total_count} 道题目"}],
+            system_prompt=system_prompt,
+            stream=False
+        )
+
+        # 解析 JSON
+        content = response.content.strip()
+        json_match = re.search(r'\[.*\]', content, re.DOTALL)
+        if json_match:
+            questions = json.loads(json_match.group(0))
+
+            # 质量校验
+            valid_questions, invalid = QuestionValidator.validate_batch(questions)
+            generated_questions.extend(valid_questions)
+
+            if invalid:
+                print(f"⚠️  {len(invalid)} 道题目格式不合法，已过滤")
+
+    except Exception as e:
+        print(f"⚠️  AI 批量生成题目失败: {e}")
+
+    # 更新状态
+    state["generated_questions"] = generated_questions
+    state["current_step"] = "generate_questions"
+    add_trace(state, "generate_questions", time.time() - start_time,
+              {"generated_count": len(generated_questions), "total_required": total_count})
+
+    return state
+
+async def assemble_exam(state: ExamWorkflowState) -> ExamWorkflowState:
+    """
+    组装最终试卷
+
+    合并题库题目和 AI 生成题目，排序，分配题号
+    """
+    start_time = time.time()
+
+    # 合并题目
+    all_questions = state["search_results"] + state["generated_questions"]
+
+    # 按题型排序（选择题 → 填空题 → 解答题）
+    type_order = ["单选题", "多选题", "填空题", "计算题", "证明题", "解答题"]
+
+    def sort_key(q):
+        qtype = q["question_type"]
+        return type_order.index(qtype) if qtype in type_order else 99
+
+    all_questions.sort(key=sort_key)
+
+    # 分配题号和分数
+    for idx, q in enumerate(all_questions, 1):
+        q["index"] = idx
+        if "score" not in q:
+            q["score"] = q.get("default_score", 5)
+
+    # 计算总分
+    total_score = sum(q["score"] for q in all_questions)
+
+    # 统计来源
+    db_count = len(state["search_results"])
+    ai_count = len(state["generated_questions"])
+
+    # 构建试卷
+    import uuid
+    final_exam = {
+        "exam_id": str(uuid.uuid4()),
+        "subject": state["extracted_params"]["subject"],
+        "grade": state["extracted_params"]["grade"],
+        "knowledge_points": state["extracted_params"].get("knowledge_points", []),
+        "scene": state["scene_config"]["scene"],
+        "questions": all_questions,
+        "total_score": total_score,
+        "question_count": len(all_questions),
+        "source_stats": {
+            "database": db_count,
+            "ai_generated": ai_count
+        },
+        "created_at": time.time()
+    }
+
+    # 更新状态
+    state["final_exam"] = final_exam
+    state["needs_followup"] = False
+    state["current_step"] = "assemble_exam"
+    add_trace(state, "assemble_exam", time.time() - start_time)
+
+    return state

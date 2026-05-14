@@ -1,0 +1,38 @@
+# 忽略前端文件
+frontend/
+
+# 忽略文档
+docs/
+*.md
+
+# 忽略 Git
+.git/
+.gitignore
+
+# 忽略环境文件
+.env
+.env.*
+
+# 忽略缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# 忽略数据库（生产环境会重新生成）
+*.db
+*.sqlite
+
+# 忽略日志
+logs/
+*.log
+
+# 忽略临时文件
+*.tmp
+*.bak
+
+# 忽略开发配置
+.vscode/
+.idea/
+.DS_Store
